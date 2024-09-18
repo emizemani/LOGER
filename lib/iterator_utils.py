@@ -1,5 +1,5 @@
 import os, sys, math
-from collections import Sized
+from collections.abc import Sized
 from ._postgres import Cursor
 
 class SizedWrapper:

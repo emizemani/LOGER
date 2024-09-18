@@ -3,9 +3,14 @@ import pickle
 import os
 import time
 import re
+import sys
 
 from lib.timer import timer as Timer
 from . import config
+
+def log(message):
+    print(message)
+    sys.stdout.flush()
 
 class _oracle_db:
     auto_save_interval = 400
@@ -23,8 +28,9 @@ class _oracle_db:
             self.__cur.execute('select null from dual')
             self.__cur.fetchall()
 
-    def __init__(self):
-        self.__db = None
+    def __init__(self, db=None):
+        self.__db = db
+        self.__cur = db.cursor() if db else None
         self.__boundary_cache = {}
         self.__selectivity_cache = {}
         self.__latency_cache = {}
@@ -34,8 +40,10 @@ class _oracle_db:
         self.name = None
         self.__auto_save_count = 0
         self.__statement_timeout = 1000000
-
         self.__executed = {}
+
+    def __execute(self, query):
+        self.__cur.execute(query)
 
     def __auto_save(self):
         if not self.use_cache:
@@ -154,30 +162,75 @@ class _oracle_db:
         assert self.__db is not None
         if table in self.__table_count_cache:
             return self.__table_count_cache[table]
-        self.__execute(f'select count(*) from {table};')
-        total_rows = self.__cur.fetchall()[0][0]
+        self.__execute(f'SELECT COUNT(*) FROM {table}')
+        total_rows = self.__cur.fetchone()[0]
         self.__table_count_cache[table] = total_rows
         self.__auto_save()
         return total_rows
 
-    def selectivity(self, table, where, explain=False):
-        assert self.__db is not None
-        query = (table, where, explain)
-        if query in self.__selectivity_cache:
-            return self.__selectivity_cache[query]
-        total_rows = self.table_size(table)
+def selectivity(self, table, where, explain=False):
+    assert self.__db is not None
+    query = (table, where, explain)
+    if query in self.__selectivity_cache:
+        return self.__selectivity_cache[query]
+
+    total_rows = self.table_size(table)
+    
+    # Log the total rows for debugging
+    log(f"Total rows for table {table}: {total_rows}")
+    
+    if total_rows == 0:
+        log(f"Warning: Total rows for table {table} is zero. Cannot compute selectivity.")
+        self.__selectivity_cache[query] = (0, 0, 0)
+        self.__auto_save()
+        return 0, 0, 0
+
+    try:
         if explain:
             self.__execute(f"explain plan set statement_id = 'current' for select * from {table} where {where}")
             self.__execute(f"select cardinality from plan_table where statement_id = 'current'")
             select_rows = self.__cur.fetchall()[0][0]
-            #select_rows = int(re.search(r'rows=([0-9]+)', select_rows).group(1))
         else:
             self.__execute(f'select count(*) from {table} where {where}')
             select_rows = self.__cur.fetchall()[0][0]
+
+        log(f"select_rows: {select_rows}, total_rows: {total_rows}")
+        
+        if select_rows == 0:
+            log(f"Warning: Select rows for table {table} with condition {where} is zero.")
+        
         res = select_rows / total_rows
-        self.__selectivity_cache[query] = res
+        log(f"Calculated selectivity: {res} (select_rows: {select_rows} / total_rows: {total_rows})")
+        self.__selectivity_cache[query] = (res, select_rows, total_rows)
         self.__auto_save()
-        return res
+        return res, select_rows, total_rows
+    except Exception as e:
+        log(f"Error calculating selectivity for table {table} with condition {where}: {e}")
+        raise
+
+
+    try:
+        if explain:
+            self.__execute(f"explain plan set statement_id = 'current' for select * from {table} where {where}")
+            self.__execute(f"select cardinality from plan_table where statement_id = 'current'")
+            select_rows = self.__cur.fetchall()[0][0]
+        else:
+            self.__execute(f'select count(*) from {table} where {where}')
+            select_rows = self.__cur.fetchall()[0][0]
+
+        if select_rows == 0:
+            log(f"Warning: Select rows for table {table} with condition {where} is zero.")
+        
+        log(f"Selected rows: {select_rows} from table {table} with condition {where}")
+        
+        res = select_rows / total_rows
+        self.__selectivity_cache[query] = (res, select_rows, total_rows)
+        self.__auto_save()
+        return res, select_rows, total_rows
+    except Exception as e:
+        log(f"Error calculating selectivity for table {table} with condition {where}: {e}")
+        raise
+
 
     def first_element(self, sql):
         assert self.__db is not None
@@ -193,7 +246,6 @@ class _oracle_db:
 
         self.__execute(f"explain plan set statement_id = 'current' for {sql}")
         cost = self.first_element(f"select cost from plan_table where statement_id = 'current'")
-        #cost = float(res.split("cost=")[1].split("..")[1].split(" ")[0])
         self.__db.commit()
         self.__cost_cache[sql] = cost
         self.__auto_save()
@@ -218,7 +270,6 @@ class _oracle_db:
 
     def result(self, sql):
         assert self.__db is not None
-        #return iterator_utils.cursor_iter(self.__db, sql)
         self.__execute(sql)
         return self.__cur.fetchall()
 
@@ -264,7 +315,7 @@ class _oracle_db:
             try:
                 latency = self.__latency(sql, cache=cache)
             except Exception as e:
-                print(f'{e.__class__.__name__}:', e, f'"""{sql}"""')
+                log(f'{e.__class__.__name__}: {e} """{sql}"""')
                 self.__db.commit()
             if latency is None:
                 latency = timeout_limit

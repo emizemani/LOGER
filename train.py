@@ -34,7 +34,9 @@ cache_manager = HashCache()
 CACHE_FILE = 'latency_cache.pkl'
 
 def dataset_generate(path, verbose=False):
+    log(f"Loading dataset from {path}")
     sqls = load(database.config, path, device=device, verbose=verbose)
+    log(f"Loaded {len(sqls)} SQLs from {path}")
     return sqls
 
 def batched(gen, batch_size=64):
@@ -113,50 +115,60 @@ class BaselineCache:
         costs = []
         for sql in sqls:
             sql : Sql
-            _, _cost = cache_latency(sql)
-            costs.append(_cost)
-            _baseline = sql.baseline.join_order
-            baseline = []
-            valid = True
-            leftdeep = True
-            if not _baseline or len(sql.baseline.aliases) != len(sql.aliases):
-                # might include subqueries
-                if _baseline:
-                    print(sql.baseline.aliases, sql.aliases)
-                log(f'Warning: Baseline of SQL {sql.filename} is not valid')
-                valid = False
-            else:
-                for index, (left, right) in enumerate(_baseline):
-                    if database.config.bushy:
-                        if index > 0:
-                            if isinstance(right, int):
-                                if isinstance(left, int):
+            try:
+                _, _cost = cache_latency(sql)
+                if _cost is not None:
+                    costs.append(_cost)
+                else:
+                    log(f"Warning: Cost for SQL {sql} is None")
+                _baseline = sql.baseline.join_order
+                baseline = []
+                valid = True
+                leftdeep = True
+                if not _baseline or len(sql.baseline.aliases) != len(sql.aliases):
+                    # might include subqueries
+                    if _baseline:
+                        print(sql.baseline.aliases, sql.aliases)
+                    log(f'Warning: Baseline of SQL {sql.filename} is not valid')
+                    valid = False
+                else:
+                    for index, (left, right) in enumerate(_baseline):
+                        if database.config.bushy:
+                            if index > 0:
+                                if isinstance(right, int):
+                                    if isinstance(left, int):
+                                        leftdeep = False
+                                    left, right = right, left
+                                elif not isinstance(left, int):
                                     leftdeep = False
-                                left, right = right, left
-                            elif not isinstance(left, int):
-                                leftdeep = False
-                        baseline.append(((left, right), 0))
-                    else:
-                        if index > 0:
-                            if isinstance(right, int):
-                                if isinstance(left, int):
+                            baseline.append(((left, right), 0))
+                        else:
+                            if index > 0:
+                                if isinstance(right, int):
+                                    if isinstance(left, int):
+                                        log(f'Warning: Baseline of SQL {sql.filename} is not left-deep')
+                                        valid = False
+                                        break
+                                    left, right = right, left
+                                elif not isinstance(left, int):
                                     log(f'Warning: Baseline of SQL {sql.filename} is not left-deep')
                                     valid = False
                                     break
-                                left, right = right, left
-                            elif not isinstance(left, int):
-                                log(f'Warning: Baseline of SQL {sql.filename} is not left-deep')
-                                valid = False
-                                break
-                        baseline.append(((left, right), 0))
-            if not valid:
+                            baseline.append(((left, right), 0))
+                if not valid:
+                    continue
+                plan = Plan(sql)
+                for left, right in _baseline:
+                    plan.join(left, right)
+                _, plan_cost = cache_latency(plan)
+                value = plan_cost / _cost
+                self.data[str(sql)] = (value, tuple(baseline), leftdeep)
+            except Exception as e:
+                log(f"Error processing SQL {sql.filename}: {e}")
                 continue
-            plan = Plan(sql)
-            for left, right in _baseline:
-                plan.join(left, right)
-            _, plan_cost = cache_latency(plan)
-            value = plan_cost / _cost
-            self.data[str(sql)] = (value, tuple(baseline), leftdeep)
+
+        if not costs:
+            raise ValueError("No costs were computed. Please check the inputs and the cache_latency function.")
 
         self.max_time = max(costs)
         self.timeout = int(database.config.sql_timeout_limit * self.max_time)
@@ -209,49 +221,63 @@ class BaselineCache:
 CACHE_INVALID_COUNT = 0
 CACHE_BACKUP_INTERVAL = 400
 _cache_use_count = 0
-def cache_latency(sql : typing.Union[Sql, Plan]):
-    if isinstance(sql, Plan):
-        hash = f'{sql.sql.filename} {sql._hash_str(hint=True)}'
-    elif isinstance(sql, Sql):
-        hash = f'{sql.filename}$'
-    else:
-        hash = str(sql)
-    cache = cache_manager.get(hash, default=None)
-    if cache is not None:
-        res, count = cache
-        count += 1
-        if CACHE_INVALID_COUNT <= 0 or count < CACHE_INVALID_COUNT:
-            cache_manager.update(hash, (res, count))
-            return res
-    else:
-        pass
-    if USE_ORACLE:
+
+def cache_latency(sql: typing.Union[Sql, Plan]):
+    try:
         if isinstance(sql, Plan):
-            key = sql.oracle()
+            hash = f'{sql.sql.filename} {sql._hash_str(hint=True)}'
         elif isinstance(sql, Sql):
-            key = sql.oracle()
+            hash = f'{sql.filename}$'
+        else:
+            hash = str(sql)
+
+        cache = cache_manager.get(hash, default=None)
+        if cache is not None:
+            res, count = cache
+            count += 1
+            if CACHE_INVALID_COUNT <= 0 or count < CACHE_INVALID_COUNT:
+                cache_manager.update(hash, (res, count))
+                return res
+        else:
+            pass
+
+        if USE_ORACLE:
+            if isinstance(sql, Plan):
+                key = sql.oracle()
+            elif isinstance(sql, Sql):
+                key = sql.oracle()
+            else:
+                key = str(sql)
         else:
             key = str(sql)
-    else:
-        key = str(sql)
-    _timer = timer()
-    with _timer:
-        raw_value = cost(key, cache=False)
-    value = _timer.time * 1000
-    value = (value, raw_value)
-    cache_manager.put(key, (value, 0), hash)
 
-    if CACHE_BACKUP_INTERVAL > 0:
-        global _cache_use_count
-        _cache_use_count += 1
-        if _cache_use_count >= CACHE_BACKUP_INTERVAL:
-            _cache_use_count = 0
-            dic = cache_manager.dump(copy=False)
-            with open(CACHE_FILE, 'wb') as f:
-                pickle.dump(dic, f)
-    return value
+        _timer = timer()
+        with _timer:
+            try:
+                raw_value = cost(key, cache=False)
+            except Exception as e:
+                log(f"Error calculating cost for SQL {key}: {e}")
+                return None, None
 
-_validate_cache = {}
+        value = _timer.time * 1000
+        value = (value, raw_value)
+        cache_manager.put(key, (value, 0), hash)
+
+        if CACHE_BACKUP_INTERVAL > 0:
+            global _cache_use_count
+            _cache_use_count += 1
+            if _cache_use_count >= CACHE_BACKUP_INTERVAL:
+                _cache_use_count = 0
+                dic = cache_manager.dump(copy=False)
+                with open(CACHE_FILE, 'wb') as f:
+                    pickle.dump(dic, f)
+
+        log(f"Computed latency for SQL {key}: {value}")
+        return value
+    except Exception as e:
+        log(f"Unexpected error in cache_latency: {e}")
+        return None, None
+
 def validate(test_set, train=False, bushy=False):
     model.eval_mode()
     res = []
@@ -337,6 +363,7 @@ def train(beam_width=1, epochs=400):
                 if USE_LATENCY:
                     baseline_manager.set_timeout()
         else:
+            print(test_set)
             baseline_manager.init(train_set, verbose=True)
             if args.no_expert_initialization:
                 baseline_manager.data.clear()
@@ -459,7 +486,6 @@ def train(beam_width=1, epochs=400):
                                             log(baseline_order)
                                             raise
                                         prev_plan = search_plans[0][0]
-                                        # No need to do deep copy, since there's no grad and no inplace operations
                                         plan = prev_plan.clone(deep=False)
                                         model.step(plan, action)
                                         search_plans = [[plan, 0, (action, join), None, prev_plan, False]]
@@ -492,7 +518,6 @@ def train(beam_width=1, epochs=400):
 
                                         search_plans = []
                                         for _this_index, (((_state_index, _state, _action), join), value) in enumerate(zip(selected, selected_values)):
-                                            # No need to do deep copy, since there's no grad and no inplace operations
                                             this_state = _state.clone(deep=False)
                                             model.step(this_state, _action, join)
                                             search_plans.append([this_state, _state_index, (_action, join), None, _state, _this_index >= _beam_width - _explore])
@@ -533,7 +558,6 @@ def train(beam_width=1, epochs=400):
                                     if value is None or join is None:
                                         continue
                                     memory_value = value / origin_value
-                                    # The representation will be updated, so there's no need to do deep copy
                                     model.add_memory(prev_plan.clone(deep=False), value / origin_value, memory_value, info=(_action, join, ), is_baseline=is_new_baseline)
                     _Time_plan += _plan_timer.time
 
@@ -638,6 +662,16 @@ def train(beam_width=1, epochs=400):
             'random_state': random_state,
             'args': args_dict,
         }, checkpoint_file, _use_new_zipfile_serialization=False)
+        
+        # Add the weight saving code here as well to ensure it's saved at the end of each epoch
+        model_path = f'results/model_weights_epoch{epoch:03d}.pth'
+        model.save(model_path)
+
+    # Add the weight saving code here as well to ensure it's saved at the end of training
+    model_path = 'results/model_weights_final.pth'
+    model.save(model_path)
+    print(f"Model weights saved to {model_path}")
+
     with open(f'baseline.pkl', 'wb') as f:
         pickle.dump(baseline_manager.data, f)
 
@@ -661,7 +695,7 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-d', '--dataset', nargs=2, type=str, default=['dataset/train', 'dataset/test'],
+    parser.add_argument('-d', '--dataset', nargs=2, type=str, default=['/home/emionatrip/Desktop/thesis/LOGER/dataset/train', '/home/emionatrip/Desktop/thesis/LOGER/dataset/test'],
                         help='Training and testing dataset.')
     parser.add_argument('-e', '--epochs', type=int, default=200,
                         help='Total epochs.')
@@ -712,7 +746,7 @@ if __name__ == '__main__':
 
     log = Logger(f'log/{FILE_ID}.log', buffering=1, stderr=True)
 
-    #torch.use_deterministic_algorithms(True)
+    # torch.use_deterministic_algorithms(True)
     seed(args.seed)
     SEED = args.seed
 
@@ -747,41 +781,44 @@ if __name__ == '__main__':
     database.config.bushy = args.bushy
 
     dataset_file = f'temps/{FILE_ID}.dataset.pkl'
-    if os.path.isfile(dataset_file):
+    dataset_exists = os.path.isfile(dataset_file)
+
+    if dataset_exists:
+        log(f"Loading dataset from {dataset_file}")
         dataset = torch.load(dataset_file, map_location=device)
         train_set, test_set = dataset
-        for _set in (train_set, test_set):
-            for sql in _set:
-                sql.to(device)
-    else:
+        # Check if loaded dataset is empty
+        if not train_set or not test_set:
+            log("Loaded dataset is empty, regenerating...")
+            dataset_exists = False
+        else:
+            for _set in (train_set, test_set):
+                for sql in _set:
+                    sql.to(device)
+
+    if not dataset_exists:
         train_path, test_path = args.dataset
 
-        log('Generating train set')
+        log(f'Generating train set from {train_path}')
         train_set = dataset_generate(train_path, verbose=True)
-        log('Generating test set')
-        test_set = dataset_generate(test_path, verbose=True)
+        log(f'Generated train set: {len(train_set)} SQLs')
 
+        log(f'Generating test set from {test_path}')
+        test_set = dataset_generate(test_path, verbose=True)
+        log(f'Generated test set: {len(test_set)} SQLs')
+
+        log(f"Saving dataset to {dataset_file}")
         torch.save([train_set, test_set], dataset_file, _use_new_zipfile_serialization=False)
 
-    if args.warm_up is not None:
-        database_warmup(train_set, k=args.warm_up)
-        seed(args.seed)
-        SEED = args.seed
+    # Check if train_set is still empty after loading/generating
+    log(f"Train set size: {len(train_set)}")
+    log(f"Test set size: {len(test_set)}")
 
-    restricted_operator = not args.no_restricted_operator
-    reward_weighting = args.weight
+    if not train_set:
+        raise ValueError("Train set is empty. Please check the dataset paths and the dataset_generate function.")
 
-    model = DeepQNet(device=device, half=200, out_dim=args.switches, num_table_layers=args.layers,
-                     use_value_predict=False, restricted_operator=restricted_operator,
-                     reward_weighting=reward_weighting, log_cap=args.log_cap)
-
-    pretrain_file = args.pretrain
-    if pretrain_file is not None and os.path.isfile(pretrain_file):
-        dic = torch.load(pretrain_file, map_location=device)
-        if 'use_gen' in dic:
-            del dic['use_gen']
-        model.model_recover(dic)
-
-    database.config.beam_width = args.beam
+    # Initialize the model after setting up the database and config
+    model = DeepQNet()  # Replace with actual model initialization
+    model.to(device)  # Move model to the correct device if necessary
 
     train(beam_width=args.beam, epochs=args.epochs)

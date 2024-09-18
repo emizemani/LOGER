@@ -2,7 +2,7 @@
 select  
    substr(w_warehouse_name,1,20)
   ,sm_type
-  ,web_name
+  ,web_site.ws_name
   ,sum(case when (ws_ship_date_sk - ws_sold_date_sk <= 30 ) then 1 else 0 end)  as "30 days" 
   ,sum(case when (ws_ship_date_sk - ws_sold_date_sk > 30) and 
                  (ws_ship_date_sk - ws_sold_date_sk <= 60) then 1 else 0 end )  as "31-60 days" 
@@ -22,12 +22,12 @@ where
 and ws_ship_date_sk   = d_date_sk
 and ws_warehouse_sk   = w_warehouse_sk
 and ws_ship_mode_sk   = sm_ship_mode_sk
-and ws_web_site_sk    = web_site_sk
+and web_sales.ws_web_site_sk    = web_site.ws_web_site_sk
 group by
    substr(w_warehouse_name,1,20)
   ,sm_type
-  ,web_name
+  ,web_site.ws_name
 order by substr(w_warehouse_name,1,20)
         ,sm_type
-       ,web_name
+       ,web_site.ws_name
 limit 100;

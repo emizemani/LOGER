@@ -3,7 +3,7 @@ import dgl
 import random
 import typing
 import math
-from collections import Iterable
+from collections.abc import Iterable
 
 from core import database, Sql, Plan
 from lib.timer import timer
@@ -128,6 +128,15 @@ class DeepQNet:
             'baseline_dict': self.baseline_dict,
             'baseline_explorer': self.baseline_reward_explorer.count,
         }
+
+    def save(self, path):
+        torch.save(self.model_export(), path)
+        print(f"Model saved to {path}")
+
+    def load(self, path):
+        state_dict = torch.load(path)
+        self.model_recover(state_dict)
+        print(f"Model loaded from {path}")
 
     def init(self, state : typing.Union[Plan, Sql], grad=False, return_graph=False):
         if isinstance(state, Sql):
